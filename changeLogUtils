@@ -1,0 +1,395 @@
+import { DocumentLogModel, IDocumentLog, IWorkflowLog, WorkflowLogModel } from '@models/common';
+import { detailedDiff } from 'deep-object-diff';
+
+const formatChangeValue = (value: any) => {
+    let formattedValue = value ? value : '';
+    if (typeof formatChangeValue !== 'string') {
+        formattedValue = JSON.stringify(formatChangeValue);
+    }
+    return formattedValue;
+};
+
+function createChangeLog(
+    oldValue: any,
+    newValue: any,
+    fieldName: string,
+    lookupNeeded: boolean,
+    processed: boolean,
+    entityId: any,
+    changedByCN: string,
+    changedBy: string,
+    modelName?: string
+) {
+    return {
+        oldValue,
+        newValue,
+        fieldName,
+        lookupNeeded,
+        processed,
+        entityId,
+        changedByCN,
+        changedBy,
+        modelName,
+    };
+}
+
+export const handleChangeLog = (
+    whiteListed: any,
+    newData: any,
+    decodedToken: any,
+    changeLogs: any[],
+    prefix: string = '',
+    lookupDict: { [key: string]: string }, // Add lookup dictionary parameter
+    ignoredFields: string[] = ['createdAt', 'updatedAt', '_id'],
+) => {
+    let username = (decodedToken?.username as string).toLowerCase();
+    const name = decodedToken?.CN as string;
+
+    for (let key in newData) {
+        if (ignoredFields.includes(key)) continue;
+        const oldValue = whiteListed[key];
+        const newValue = newData[key];
+
+        if (newValue && newValue !== oldValue) {
+            const fieldName = prefix ? `${prefix}.${key}` : key;
+            const diff: any = detailedDiff(oldValue, newValue);
+            if (
+                (Array.isArray(oldValue) && Array.isArray(newValue)) ||
+                (typeof oldValue === 'object' && typeof newValue === 'object')
+            ) {
+                console.log(fieldName,"mew")
+                if (diff.added)
+                    handleNestedChanges(
+                        diff.added,
+                        'added',
+                        newValue,
+                        oldValue,
+                        whiteListed,
+                        name,
+                        username,
+                        changeLogs,
+                        fieldName,
+                        ignoredFields,
+                        lookupDict
+                    );
+                if (diff.deleted)
+                    handleNestedChanges(
+                        diff.deleted,
+                        'deleted',
+                        newValue,
+                        oldValue,
+                        whiteListed,
+                        name,
+                        username,
+                        changeLogs,
+                        fieldName,
+                        ignoredFields,
+                        lookupDict
+                    );
+                if (diff.updated)
+                    handleNestedChanges(
+                        diff.updated,
+                        'updated',
+                        newValue,
+                        oldValue,
+                        whiteListed,
+                        name,
+                        username,
+                        changeLogs,
+                        fieldName,
+                        ignoredFields,
+                        lookupDict
+                    );
+            } else {
+                handleSimpleChanges(
+                    oldValue,
+                    newValue,
+                    key,
+                    fieldName,
+                    changeLogs,
+                    whiteListed,
+                    name,
+                    username,
+                    lookupDict
+                );
+            }
+        }
+    }
+};
+
+export async function logChanges(changes: Partial<IDocumentLog>[] = []) {
+    await DocumentLogModel.insertMany(changes);
+}
+
+export async function workflowChanges(changes: IWorkflowLog) {
+    await WorkflowLogModel.create(changes);
+}
+
+const getNestedKeys = (obj: any, prefix: string = '', ignoredFields: string[]): string[] => {
+    let keys: string[] = [];
+    for (let key in obj) {
+        if (ignoredFields.includes(key)) continue;
+        if (typeof obj[key] === 'object' && obj[key] !== null) {
+            const nestedKeys = getNestedKeys(obj[key], prefix ? `${prefix}.${key}` : key, ignoredFields);
+            keys = [...keys, ...nestedKeys];
+        } else {
+            keys.push(prefix ? `${prefix}.${key}` : key);
+        }
+    }
+    return keys;
+};
+
+const getValueByKey = (obj: any, key: string) => {
+    const keys = key.split('.');
+    let value = obj;
+    for (let k of keys) {
+        const parsedKey = parseInt(k);
+        if (!isNaN(parsedKey)) {
+            value = value[parsedKey];
+        } else {
+            value = value[k];
+        }
+    }
+    return value;
+};
+
+function handleSimpleChanges(
+    oldValue: any,
+    newValue: any,
+    key: string,
+    fieldName: string,
+    changeLogs: any[],
+    existingEntry: any,
+    name: string,
+    username: string,
+    lookupDict: { [key: string]: string } = {}
+) {
+    const lookupNeeded = lookupDict.hasOwnProperty(key);
+    const modelName = lookupDict[key];
+
+    if (oldValue instanceof Date) {
+        // Format the date strings
+        oldValue = oldValue.toISOString().split('T')[0]; // Format: YYYY-MM-DD
+    }
+    if (oldValue.toString() !== newValue.toString()) {
+        changeLogs.push(
+            createChangeLog(
+                oldValue.toString(),
+                newValue.toString(),
+                fieldName,
+                lookupNeeded,
+                !lookupNeeded,
+                existingEntry._id,
+                name,
+                username,
+                modelName
+            )
+        );
+    }
+}
+
+function handleNestedChanges(
+    diff: any,
+    changeType: string,
+    newValue: any,
+    oldValue: any,
+    existingEntry: any,
+    name: string,
+    username: string,
+    changeLogs: any[],
+    prefix: string,
+    ignoredFields: string[],
+    lookupDict: { [key: string]: string } = {}
+) {
+    const keys = getNestedKeys(diff, '', ignoredFields);
+    keys.forEach((key) => {
+        const value = getValueByKey(newValue, key);
+        const fieldName = prefix ? `${prefix}.${key}` : key;
+
+        const keySegments = key.split('.');
+        let lookupNeeded = false;
+        let modelName = undefined;
+        for (const segment of keySegments) {
+            if (lookupDict.hasOwnProperty(segment)) {
+                lookupNeeded = true;
+                modelName = lookupDict[segment];
+                break;
+            }
+        }
+
+        if (changeType === 'added') {
+            changeLogs.push(
+                createChangeLog(
+                    null,
+                    value,
+                    fieldName,
+                    lookupNeeded,
+                    !lookupNeeded,
+                    existingEntry._id,
+                    name,
+                    username,
+                    modelName
+                )
+            );
+        } else if (changeType === 'deleted') {
+            changeLogs.push(
+                createChangeLog(
+                    value,
+                    null,
+                    fieldName,
+                    lookupNeeded,
+                    !lookupNeeded,
+                    existingEntry._id,
+                    name,
+                    username,
+                    modelName
+                )
+            );
+        } else if (changeType === 'updated') {
+            let oldVal = getValueByKey(oldValue, key);
+            if (oldVal instanceof Date) {
+                // Format the date strings
+                oldVal = oldVal.toISOString(); // Format: YYYY-MM-DD
+            }
+            if (oldVal.toString() !== value.toString()) {
+                changeLogs.push(
+                    createChangeLog(
+                        oldVal,
+                        value,
+                        fieldName,
+                        lookupNeeded,
+                        !lookupNeeded,
+                        existingEntry._id,
+                        name,
+                        username,
+                        modelName
+                    )
+                );
+            }
+        }
+    });
+}
+
+// export const getChangeLogEntries = (
+//  existingData: any,
+//  updateData: any,
+//  decodedToken: any,
+//  changeLogs: any[],
+//  dateKeys: string[] = [],
+//  ignoredFields: string[] = [],
+//  lookUpFields: string[] = []
+// ) => {
+//  let username = decodedToken?.username as string;
+//  username = username.toLowerCase();
+//  const name = decodedToken?.CN as string;
+//  for (let key in updateData) {
+//      if (dateKeys.includes(key)) {
+//          if (ignoredFields.includes(key)) continue;
+//          let oldValue = existingData[key];
+//          let newValue = updateData[key];
+//          // Handle the date case
+//          if (oldValue instanceof Date) {
+//              let fieldName = key
+//                  .replace(/([A-Z])/g, ' $1')
+//                  .trim()
+//                  .replace(/^./, (str) => str.toUpperCase());
+//              // Format the date strings
+//              let oldDateFormatted = oldValue.toISOString().split('T')[0]; // Format: YYYY-MM-DD
+//              if (newValue !== oldDateFormatted) {
+//                  // Create change log for date fields
+//                  changeLogs.push({
+//                      oldValue: oldDateFormatted,
+//                      newValue: newValue,
+//                      fieldName: fieldName,
+//                      lookupNeeded: false,
+//                      processed: true,
+//                      entityId: existingData._id,
+//                      changedByCN: name,
+//                      changedBy: username,
+//                  });
+//              }
+//          }
+//      } else if (updateData[key] && updateData[key] !== existingData[key]) {
+//          let oldValue = existingData[key];
+//          let newValue = updateData[key];
+//          let fieldName = key
+//              .replace(/([A-Z])/g, ' $1')
+//              .trim()
+//              .replace(/^./, (str: string) => str.toUpperCase());
+//          // Check if the value is an array
+//          if (Array.isArray(oldValue) && Array.isArray(newValue)) {
+//              if (typeof newValue === 'object') {
+//                  processNestedObject(oldValue, newValue, existingData, decodedToken, changeLogs, key);
+//              } else {
+//                  // Identify added and removed elements
+//                  if (Array.isArray(newValue) && Array.isArray(oldValue)) {
+//                      const added = (newValue as string[]).filter(
+//                          (el: string) => !(oldValue as string[]).includes(el)
+//                      );
+//                      const removed = (oldValue as string[]).filter(
+//                          (el: string) => !(newValue as string[]).includes(el)
+//                      );
+
+//                      // Create change logs for added elements
+//                      added.forEach((value: string) => {
+//                          changeLogs.push({
+//                              oldValue: null,
+//                              newValue: value,
+//                              fieldName: fieldName,
+//                              lookupNeeded: false,
+//                              processed: true,
+//                              entityId: existingData._id,
+//                              changedByCN: name,
+//                              changedBy: username,
+//                          });
+//                      });
+
+//                      // Create change logs for removed elements
+//                      removed.forEach((value: string) => {
+//                          changeLogs.push({
+//                              oldValue: value,
+//                              newValue: null,
+//                              fieldName: fieldName,
+//                              lookupNeeded: false,
+//                              processed: true,
+//                              entityId: existingData._id,
+//                              changedByCN: name,
+//                              changedBy: username,
+//                          });
+//                      });
+//                  }
+//              }
+//          } else if (typeof newValue === 'object') {
+//              processNestedObject(oldValue, newValue, existingData, decodedToken, changeLogs, key);
+//          } else {
+//              if (oldValue && newValue) {
+//                  if (oldValue.toString() !== newValue.toString()) {
+//                      changeLogs.push({
+//                          oldValue: oldValue,
+//                          newValue: newValue,
+//                          fieldName: fieldName,
+//                          lookupNeeded: false,
+//                          processed: true,
+//                          entityId: existingData._id,
+//                          changedByCN: name,
+//                          changedBy: username,
+//                      });
+//                  }
+//              } else if (oldValue !== newValue) {
+//                  // Create change logs for non-array fields
+//                  changeLogs.push({
+//                      oldValue: oldValue,
+//                      newValue: newValue,
+//                      fieldName: fieldName,
+//                      lookupNeeded: false,
+//                      processed: true,
+//                      entityId: existingData._id,
+//                      changedByCN: name,
+//                      changedBy: username,
+//                  });
+//              }
+//          }
+//      }
+//  }
+//  console.log(changeLogs);
+// };
